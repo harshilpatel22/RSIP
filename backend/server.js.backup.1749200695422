@@ -1,0 +1,2144 @@
+// ========================================
+// RSIP Complete Server - WhatsApp Bot + API + WebSocket
+// File: whatsapp-bot/server.js
+// ========================================
+
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+const axios = require('axios');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+
+// Firebase configuration
+const { db } = require('./config/firebase');
+
+// ========================================
+// Express App Setup
+// ========================================
+
+const app = express();
+const server = http.createServer(app);
+
+// Security and middleware
+app.use(helmet());
+app.use(morgan('combined'));
+app.use(cors({
+  origin: [
+    'http://localhost:3001', 
+    'https://your-dashboard-url.vercel.app',
+    process.env.DASHBOARD_URL
+  ].filter(Boolean),
+  credentials: true
+}));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// Serve static files (for uploaded photos)
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Ensure uploads directory exists
+if (!fs.existsSync('./uploads')) {
+  fs.mkdirSync('./uploads');
+}
+
+// ========================================
+// WebSocket Server Setup
+// ========================================
+
+const wss = new WebSocket.Server({ 
+  server,
+  path: '/ws',
+  clientTracking: true
+});
+
+// Store connected dashboard clients
+const connectedClients = new Map();
+
+wss.on('connection', (ws, req) => {
+  const clientId = `client_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  const clientInfo = {
+    ws,
+    id: clientId,
+    connectedAt: new Date(),
+    lastPing: new Date(),
+    wardFilter: null,
+    isAlive: true
+  };
+
+  connectedClients.set(clientId, clientInfo);
+  console.log(`📡 Dashboard client connected: ${clientId} (Total: ${connectedClients.size})`);
+
+  // Send welcome message
+  ws.send(JSON.stringify({
+    type: 'CONNECTION_ESTABLISHED',
+    clientId,
+    timestamp: new Date().toISOString(),
+    message: 'Connected to RSIP real-time updates'
+  }));
+
+  // Handle incoming messages from dashboard
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      handleDashboardMessage(clientId, data);
+    } catch (error) {
+      console.error('Error parsing WebSocket message:', error);
+    }
+  });
+
+  // Handle client disconnect
+  ws.on('close', () => {
+    console.log(`📡 Dashboard client disconnected: ${clientId}`);
+    connectedClients.delete(clientId);
+  });
+
+  // Handle connection errors
+  ws.on('error', (error) => {
+    console.error(`WebSocket error for client ${clientId}:`, error);
+    connectedClients.delete(clientId);
+  });
+
+  // Ping-pong for connection health
+  ws.on('pong', () => {
+    const client = connectedClients.get(clientId);
+    if (client) {
+      client.lastPing = new Date();
+      client.isAlive = true;
+    }
+  });
+
+  // Set up ping interval
+  const pingInterval = setInterval(() => {
+    const client = connectedClients.get(clientId);
+    if (client && client.ws.readyState === WebSocket.OPEN) {
+      if (!client.isAlive) {
+        console.log(`💀 Terminating unresponsive client: ${clientId}`);
+        client.ws.terminate();
+        connectedClients.delete(clientId);
+        clearInterval(pingInterval);
+        return;
+      }
+      client.isAlive = false;
+      client.ws.ping();
+    } else {
+      clearInterval(pingInterval);
+    }
+  }, 30000);
+});
+
+// ========================================
+// WebSocket Helper Functions
+// ========================================
+
+const broadcastToAllClients = (data) => {
+  const message = JSON.stringify({
+    ...data,
+    timestamp: new Date().toISOString()
+  });
+  
+  let sentCount = 0;
+  let failedCount = 0;
+
+  connectedClients.forEach((client, clientId) => {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      try {
+        client.ws.send(message);
+        sentCount++;
+      } catch (error) {
+        console.error(`Failed to send message to client ${clientId}:`, error);
+        connectedClients.delete(clientId);
+        failedCount++;
+      }
+    } else {
+      connectedClients.delete(clientId);
+      failedCount++;
+    }
+  });
+
+  console.log(`📡 Broadcast sent to ${sentCount} clients, ${failedCount} failed/removed`);
+  return { sent: sentCount, failed: failedCount };
+};
+
+const broadcastToWard = (wardId, data) => {
+  const message = JSON.stringify({
+    ...data,
+    wardId,
+    timestamp: new Date().toISOString()
+  });
+  
+  let sentCount = 0;
+  connectedClients.forEach((client, clientId) => {
+    if (client.ws.readyState === WebSocket.OPEN && 
+        (!client.wardFilter || client.wardFilter === wardId)) {
+      try {
+        client.ws.send(message);
+        sentCount++;
+      } catch (error) {
+        console.error(`Failed to send ward message to client ${clientId}:`, error);
+      }
+    }
+  });
+
+  console.log(`📡 Ward ${wardId} broadcast sent to ${sentCount} clients`);
+  return sentCount;
+};
+
+const handleDashboardMessage = (clientId, data) => {
+  const client = connectedClients.get(clientId);
+  if (!client) return;
+
+  switch (data.type) {
+    case 'SUBSCRIBE_WARD':
+      client.wardFilter = data.wardId;
+      client.ws.send(JSON.stringify({
+        type: 'SUBSCRIPTION_CONFIRMED',
+        wardId: data.wardId,
+        message: `Subscribed to Ward ${data.wardId} updates`
+      }));
+      break;
+
+    case 'UNSUBSCRIBE_WARD':
+      client.wardFilter = null;
+      client.ws.send(JSON.stringify({
+        type: 'SUBSCRIPTION_CONFIRMED',
+        wardId: null,
+        message: 'Subscribed to all ward updates'
+      }));
+      break;
+
+    case 'PING':
+      client.lastPing = new Date();
+      client.ws.send(JSON.stringify({
+        type: 'PONG',
+        timestamp: new Date().toISOString()
+      }));
+      break;
+
+    case 'GET_STATUS':
+      client.ws.send(JSON.stringify({
+        type: 'STATUS_RESPONSE',
+        data: {
+          connectedClients: connectedClients.size,
+          uptime: process.uptime(),
+          wardFilter: client.wardFilter
+        }
+      }));
+      break;
+  }
+};
+
+// ========================================
+// REST API Endpoints
+// ========================================
+
+// GET /api/issues - Fetch all issues with filtering
+app.get('/api/issues', async (req, res) => {
+  try {
+    const { ward, status, timeRange, category, severity, limit = 100 } = req.query;
+    console.log('📊 Fetching issues with filters:', req.query);
+    
+    let query = db.collection('complaints');
+    
+    // Apply filters
+    if (ward && ward !== 'all' && ward !== '') {
+      query = query.where('wardId', '==', parseInt(ward));
+    }
+    
+    if (status && status !== 'all' && status !== '') {
+      query = query.where('status', '==', status);
+    }
+    
+    if (category && category !== 'all' && category !== '') {
+      query = query.where('category.id', '==', category);
+    }
+    
+    if (severity && severity !== 'all' && severity !== '') {
+      query = query.where('severity', '==', severity);
+    }
+    
+    // Apply time range filter
+    if (timeRange && timeRange !== 'all' && timeRange !== '') {
+      const now = new Date();
+      let startDate = new Date();
+      
+      switch (timeRange) {
+        case '24h':
+          startDate.setHours(now.getHours() - 24);
+          break;
+        case '7d':
+          startDate.setDate(now.getDate() - 7);
+          break;
+        case '30d':
+          startDate.setDate(now.getDate() - 30);
+          break;
+        case '90d':
+          startDate.setDate(now.getDate() - 90);
+          break;
+      }
+      
+      if (startDate) {
+        query = query.where('timestamps.created', '>=', startDate);
+      }
+    }
+    
+    // Order by creation date (newest first) and apply limit
+    query = query.orderBy('timestamps.created', 'desc').limit(parseInt(limit));
+    
+    const snapshot = await query.get();
+    const issues = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id, 
+        ...data,
+        // Ensure timestamps are properly formatted for JSON
+        timestamps: {
+          created: data.timestamps?.created?.toDate ? 
+            data.timestamps.created.toDate().toISOString() : data.timestamps?.created,
+          updated: data.timestamps?.updated?.toDate ? 
+            data.timestamps.updated.toDate().toISOString() : data.timestamps?.updated,
+          resolved: data.timestamps?.resolved?.toDate ? 
+            data.timestamps.resolved.toDate().toISOString() : data.timestamps?.resolved
+        }
+      };
+    });
+    
+    console.log(`✅ Found ${issues.length} issues`);
+    res.json(issues);
+    
+  } catch (error) {
+    console.error('❌ Error fetching issues:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PATCH /api/issues/:id - Update issue status
+app.patch('/api/issues/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+    
+    console.log(`📝 Updating issue ${id} with:`, updates);
+    
+    // Get current issue data
+    const docRef = db.collection('complaints').doc(id);
+    const doc = await docRef.get();
+    
+    if (!doc.exists) {
+      return res.status(404).json({ error: 'Issue not found' });
+    }
+    
+    const currentData = doc.data();
+    
+    // Prepare update data
+    const updateData = {
+      ...updates,
+      'timestamps.updated': new Date()
+    };
+    
+    // If status is being changed to resolved, add resolved timestamp
+    if (updates.status === 'resolved') {
+      updateData['timestamps.resolved'] = new Date();
+    }
+    
+    // Update in database
+    await docRef.update(updateData);
+    
+    // Get updated document
+    const updatedDoc = await docRef.get();
+    const updatedData = { 
+      id: updatedDoc.id, 
+      ...updatedDoc.data(),
+      timestamps: {
+        created: updatedDoc.data().timestamps?.created?.toDate?.() || updatedDoc.data().timestamps?.created,
+        updated: updatedDoc.data().timestamps?.updated?.toDate?.() || updatedDoc.data().timestamps?.updated,
+        resolved: updatedDoc.data().timestamps?.resolved?.toDate?.() || updatedDoc.data().timestamps?.resolved
+      }
+    };
+    
+    // Broadcast update to dashboards
+    broadcastToAllClients({
+      type: 'ISSUE_UPDATED',
+      data: updatedData,
+      changes: updates
+    });
+    
+    // Send status-specific notifications
+    if (updates.status) {
+      const notificationType = updates.status === 'resolved' ? 'success' : 'info';
+      const statusMessage = updates.status === 'resolved' ? 'resolved' : 
+                           updates.status === 'in_progress' ? 'assigned to team' : 
+                           `marked as ${updates.status}`;
+      
+      broadcastToAllClients({
+        type: 'NOTIFICATION',
+        data: {
+          id: Date.now(),
+          type: notificationType,
+          message: `Issue #${id} ${statusMessage}`,
+          complaintId: id,
+          wardId: updatedData.wardId,
+          time: 'Just now'
+        }
+      });
+    }
+    
+    // Send WhatsApp notification to user
+    if (updates.status || updates.rmcResponse) {
+      try {
+        await notifyUserOfUpdate(id, currentData, updates);
+      } catch (notifyError) {
+        console.error('Failed to send user notification:', notifyError);
+      }
+    }
+    
+    console.log(`✅ Issue ${id} updated successfully`);
+    res.json({ success: true, data: updatedData });
+    
+  } catch (error) {
+    console.error('❌ Error updating issue:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PATCH /api/issues/:id/assign - Assign team to issue
+app.patch('/api/issues/:id/assign', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { teamName, assignedBy, notes } = req.body;
+    
+    console.log(`👥 Assigning issue ${id} to team: ${teamName}`);
+    
+    const updates = {
+      assignedTo: teamName,
+      assignedBy: assignedBy || 'RMC Dashboard',
+      assignmentNotes: notes || '',
+      status: 'in_progress',
+      'timestamps.assigned': new Date(),
+      'timestamps.updated': new Date()
+    };
+    
+    const docRef = db.collection('complaints').doc(id);
+    await docRef.update(updates);
+    
+    // Get updated data
+    const doc = await docRef.get();
+    const updatedData = { 
+      id: doc.id, 
+      ...doc.data(),
+      timestamps: {
+        created: doc.data().timestamps?.created?.toDate?.() || doc.data().timestamps?.created,
+        updated: doc.data().timestamps?.updated?.toDate?.() || doc.data().timestamps?.updated,
+        assigned: doc.data().timestamps?.assigned?.toDate?.() || doc.data().timestamps?.assigned,
+        resolved: doc.data().timestamps?.resolved?.toDate?.() || doc.data().timestamps?.resolved
+      }
+    };
+    
+    // Broadcast assignment
+    broadcastToAllClients({
+      type: 'ISSUE_ASSIGNED',
+      data: updatedData
+    });
+    
+    broadcastToAllClients({
+      type: 'NOTIFICATION',
+      data: {
+        id: Date.now(),
+        type: 'info',
+        message: `Issue #${id} assigned to ${teamName}`,
+        complaintId: id,
+        wardId: updatedData.wardId,
+        time: 'Just now'
+      }
+    });
+    
+    console.log(`✅ Issue ${id} assigned to ${teamName}`);
+    res.json({ success: true, data: updatedData });
+    
+  } catch (error) {
+    console.error('❌ Error assigning team:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/analytics - Get analytics data
+app.get('/api/analytics', async (req, res) => {
+  try {
+    const { range = '7d', ward } = req.query;
+    
+    console.log(`📊 Calculating analytics for range: ${range}, ward: ${ward || 'all'}`);
+    
+    // Calculate date range
+    const endDate = new Date();
+    const startDate = new Date();
+    
+    switch (range) {
+      case '24h':
+        startDate.setHours(startDate.getHours() - 24);
+        break;
+      case '7d':
+        startDate.setDate(startDate.getDate() - 7);
+        break;
+      case '30d':
+        startDate.setDate(startDate.getDate() - 30);
+        break;
+      case '90d':
+        startDate.setDate(startDate.getDate() - 90);
+        break;
+      default:
+        startDate.setDate(startDate.getDate() - 7);
+    }
+    
+    let query = db.collection('complaints');
+    
+    // Apply ward filter if specified
+    if (ward && ward !== 'all') {
+      query = query.where('wardId', '==', parseInt(ward));
+    }
+    
+    // Get issues in date range
+    query = query.where('timestamps.created', '>=', startDate);
+    const snapshot = await query.get();
+    const issues = snapshot.docs.map(doc => doc.data());
+    
+    // Calculate detailed analytics
+    const analytics = {
+      totalIssues: issues.length,
+      resolutionRate: calculateResolutionRate(issues),
+      avgResponseTime: calculateAvgResponseTime(issues),
+      activeUsers: await getActiveUsersCount(),
+      issuesTrend: generateDetailedIssuesTrend(issues, range),
+      categoryBreakdown: generateDetailedCategoryBreakdown(issues),
+      wardStats: await generateDetailedWardStats(issues, ward),
+      responseTimeData: generateDetailedResponseTimeData(issues),
+      severityBreakdown: generateSeverityBreakdown(issues),
+      statusBreakdown: generateStatusBreakdown(issues)
+    };
+    
+    console.log('✅ Analytics calculated successfully');
+    res.json(analytics);
+    
+  } catch (error) {
+    console.error('❌ Error calculating analytics:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+// ========================================
+// ADD THESE API ENDPOINTS TO YOUR EXISTING server.js
+// Place these routes after your existing API endpoints
+// ========================================
+
+// GET /api/dashboard/stats - Dashboard overview statistics  
+app.get('/api/dashboard/stats', async (req, res) => {
+  try {
+    console.log('📊 Fetching dashboard stats...');
+    
+    // Get all complaints for general stats
+    const complaintsRef = db.collection('complaints');
+    const snapshot = await complaintsRef.get();
+    const allIssues = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    
+    // Calculate time-based stats (this week vs last week)
+    const now = new Date();
+    const thisWeekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
+    const lastWeekStart = new Date(thisWeekStart.getTime() - 7 * 24 * 60 * 60 * 1000);
+    
+    const thisWeekIssues = allIssues.filter(issue => {
+      const created = issue.timestamps?.created?.toDate ? 
+        issue.timestamps.created.toDate() : new Date(issue.timestamps?.created);
+      return created >= thisWeekStart;
+    });
+    
+    const lastWeekIssues = allIssues.filter(issue => {
+      const created = issue.timestamps?.created?.toDate ? 
+        issue.timestamps.created.toDate() : new Date(issue.timestamps?.created);
+      return created >= lastWeekStart && created < thisWeekStart;
+    });
+    
+    const resolvedThisWeek = thisWeekIssues.filter(issue => 
+      issue.status === 'resolved'
+    ).length;
+    
+    const resolvedLastWeek = lastWeekIssues.filter(issue => 
+      issue.status === 'resolved'
+    ).length;
+    
+    // Get active users count
+    const usersSnapshot = await db.collection('users').get();
+    const activeUsers = usersSnapshot.docs.filter(doc => {
+      const lastActive = doc.data().lastActive?.toDate ? 
+        doc.data().lastActive.toDate() : new Date(doc.data().lastActive);
+      const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      return lastActive >= weekAgo;
+    }).length;
+    
+    const stats = {
+      totalIssues: allIssues.length,
+      openIssues: allIssues.filter(issue => issue.status === 'open').length,
+      resolvedIssues: allIssues.filter(issue => issue.status === 'resolved').length,
+      criticalIssues: allIssues.filter(issue => issue.severity === 'critical').length,
+      avgResponseTime: calculateAvgResponseTime(allIssues),
+      activeUsers: activeUsers,
+      newIssuesThisWeek: thisWeekIssues.length,
+      resolvedThisWeek: resolvedThisWeek,
+      newUsersThisWeek: usersSnapshot.docs.filter(doc => {
+        const created = doc.data().createdAt?.toDate ? 
+          doc.data().createdAt.toDate() : new Date(doc.data().lastActive);
+        return created >= thisWeekStart;
+      }).length,
+      // Comparison with last week
+      weeklyGrowth: {
+        issues: thisWeekIssues.length - lastWeekIssues.length,
+        resolved: resolvedThisWeek - resolvedLastWeek
+      }
+    };
+    
+    console.log('✅ Dashboard stats calculated:', stats);
+    res.json(stats);
+    
+  } catch (error) {
+    console.error('❌ Error fetching dashboard stats:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/dashboard/recent - Recent activity for dashboard
+app.get('/api/dashboard/recent', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 10;
+    
+    console.log(`📋 Fetching ${limit} recent issues...`);
+    
+    const complaintsRef = db.collection('complaints');
+    const snapshot = await complaintsRef
+      .orderBy('timestamps.created', 'desc')
+      .limit(limit)
+      .get();
+    
+    const recentIssues = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        ...data,
+        // Ensure timestamps are properly formatted
+        timestamps: {
+          created: data.timestamps?.created?.toDate ? 
+            data.timestamps.created.toDate().toISOString() : data.timestamps?.created,
+          updated: data.timestamps?.updated?.toDate ? 
+            data.timestamps.updated.toDate().toISOString() : data.timestamps?.updated,
+          resolved: data.timestamps?.resolved?.toDate ? 
+            data.timestamps.resolved.toDate().toISOString() : data.timestamps?.resolved
+        }
+      };
+    });
+    
+    console.log(`✅ Found ${recentIssues.length} recent issues`);
+    res.json(recentIssues);
+    
+  } catch (error) {
+    console.error('❌ Error fetching recent activity:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/bot/status - WhatsApp bot status
+app.get('/api/bot/status', async (req, res) => {
+  try {
+    console.log('🤖 Checking bot status...');
+    
+    const botStatus = {
+      isConnected: client && client.info ? true : false,
+      lastSeen: client && client.info ? new Date().toISOString() : null,
+      phoneNumber: client && client.info ? client.info.wid.user : null,
+      state: client ? client.getState() : 'DISCONNECTED',
+      totalUsers: 0,
+      activeConversations: userSessions.size,
+      messagesProcessed: 0, // This would be tracked in production
+      errorCount: 0, // This would be tracked in production
+      uptime: Math.round(process.uptime())
+    };
+    
+    // Get user count from database
+    try {
+      const usersSnapshot = await db.collection('users').get();
+      botStatus.totalUsers = usersSnapshot.size;
+    } catch (dbError) {
+      console.error('Error getting user count:', dbError);
+    }
+    
+    console.log('✅ Bot status retrieved:', botStatus);
+    res.json(botStatus);
+    
+  } catch (error) {
+    console.error('❌ Error getting bot status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/bot/stats - Bot usage statistics
+app.get('/api/bot/stats', async (req, res) => {
+  try {
+    console.log('📊 Calculating bot stats...');
+    
+    // Get user language breakdown
+    const usersSnapshot = await db.collection('users').get();
+    const users = usersSnapshot.docs.map(doc => doc.data());
+    
+    const languageBreakdown = {
+      gujarati: 0,
+      hindi: 0,
+      english: 0
+    };
+    
+    users.forEach(user => {
+      if (user.language && languageBreakdown.hasOwnProperty(user.language)) {
+        languageBreakdown[user.language]++;
+      }
+    });
+    
+    const total = users.length;
+    
+    // Get recent complaints for message type analysis
+    const complaintsSnapshot = await db.collection('complaints')
+      .where('timestamps.created', '>=', new Date(Date.now() - 7 * 24 * 60 * 60 * 1000))
+      .get();
+    
+    const recentComplaints = complaintsSnapshot.docs.map(doc => doc.data());
+    
+    const messageTypes = {
+      text: recentComplaints.filter(c => !c.photos || c.photos.length === 0).length,
+      image: recentComplaints.filter(c => c.photos && c.photos.length > 0).length,
+      location: recentComplaints.filter(c => c.location && c.location.lat).length,
+      voice: 0 // Voice messages would be tracked separately in production
+    };
+    
+    const stats = {
+      languageBreakdown: Object.entries(languageBreakdown).map(([language, count]) => ({
+        language: language.charAt(0).toUpperCase() + language.slice(1),
+        count,
+        percentage: total > 0 ? Math.round((count / total) * 100) : 0
+      })),
+      messageTypes: Object.entries(messageTypes).map(([type, count]) => ({
+        type: type.charAt(0).toUpperCase() + type.slice(1),
+        count
+      })),
+      hourlyActivity: generateHourlyActivity(recentComplaints),
+      totalInteractions: total,
+      activeToday: users.filter(user => {
+        const lastActive = user.lastActive?.toDate ? 
+          user.lastActive.toDate() : new Date(user.lastActive);
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        return lastActive >= today;
+      }).length
+    };
+    
+    console.log('✅ Bot stats calculated');
+    res.json(stats);
+    
+  } catch (error) {
+    console.error('❌ Error getting bot stats:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/bot/conversations - Recent conversations
+app.get('/api/bot/conversations', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 10;
+    
+    console.log(`💬 Fetching ${limit} recent conversations...`);
+    
+    // Get recent complaints as conversations
+    const complaintsSnapshot = await db.collection('complaints')
+      .orderBy('timestamps.created', 'desc')
+      .limit(limit)
+      .get();
+    
+    const conversations = complaintsSnapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        phoneNumber: data.phoneNumber,
+        lastMessage: data.description || 'No message',
+        timestamp: data.timestamps?.created?.toDate ? 
+          data.timestamps.created.toDate().toISOString() : data.timestamps?.created,
+        language: data.language || 'gujarati',
+        status: data.status === 'resolved' ? 'completed' : 'in_progress',
+        category: data.category?.en || 'Unknown',
+        wardId: data.wardId
+      };
+    });
+    
+    console.log(`✅ Found ${conversations.length} recent conversations`);
+    res.json(conversations);
+    
+  } catch (error) {
+    console.error('❌ Error fetching conversations:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/export/issues - Export issues to CSV
+app.get('/api/export/issues', async (req, res) => {
+  try {
+    const { format = 'csv', ...filters } = req.query;
+    
+    console.log(`📥 Exporting issues in ${format} format with filters:`, filters);
+    
+    // Get filtered issues (reuse existing filter logic)
+    let query = db.collection('complaints');
+    
+    // Apply filters (same logic as /api/issues)
+    if (filters.ward && filters.ward !== 'all') {
+      query = query.where('wardId', '==', parseInt(filters.ward));
+    }
+    
+    if (filters.status && filters.status !== 'all') {
+      query = query.where('status', '==', filters.status);
+    }
+    
+    if (filters.severity && filters.severity !== 'all') {
+      query = query.where('severity', '==', filters.severity);
+    }
+    
+    // Apply time range filter
+    if (filters.timeRange && filters.timeRange !== 'all') {
+      const now = new Date();
+      let startDate = new Date();
+      
+      switch (filters.timeRange) {
+        case '24h':
+          startDate.setHours(now.getHours() - 24);
+          break;
+        case '7d':
+          startDate.setDate(now.getDate() - 7);
+          break;
+        case '30d':
+          startDate.setDate(now.getDate() - 30);
+          break;
+        case '90d':
+          startDate.setDate(now.getDate() - 90);
+          break;
+      }
+      
+      if (startDate) {
+        query = query.where('timestamps.created', '>=', startDate);
+      }
+    }
+    
+    const snapshot = await query.orderBy('timestamps.created', 'desc').get();
+    const issues = snapshot.docs.map(doc => {
+      const data = doc.data();
+      return {
+        id: doc.id,
+        category: data.category?.en || 'Unknown',
+        ward: data.wardId,
+        status: data.status,
+        severity: data.severity,
+        created: data.timestamps?.created?.toDate ? 
+          data.timestamps.created.toDate().toLocaleString() : data.timestamps?.created,
+        location: data.location?.address || 'Not provided',
+        description: data.description || 'No description',
+        assignedTo: data.assignedTo || 'Unassigned',
+        phoneNumber: data.phoneNumber,
+        language: data.language,
+        wardOfficer: data.wardOfficer || '',
+        rmcResponse: data.rmcResponse || ''
+      };
+    });
+    
+    if (format === 'csv') {
+      const csvContent = convertIssuesToCSV(issues);
+      
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="rsip_issues_${new Date().toISOString().split('T')[0]}.csv"`);
+      res.send(csvContent);
+    } else {
+      res.json(issues);
+    }
+    
+    console.log(`✅ Exported ${issues.length} issues in ${format} format`);
+    
+  } catch (error) {
+    console.error('❌ Error exporting issues:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ========================================
+// WhatsApp Bot Setup
+// ========================================
+
+
+// Create .wwebjs_auth directory if it doesn't exist
+const authPath = path.join(__dirname, '.wwebjs_auth');
+if (!fs.existsSync(authPath)) {
+  fs.mkdirSync(authPath, { recursive: true });
+  console.log('📁 Created .wwebjs_auth directory');
+}
+
+// WhatsApp Client with persistent session
+const client = new Client({
+  authStrategy: new LocalAuth({
+    clientId: process.env.BOT_SESSION_NAME || 'rsip-bot-session',
+    dataPath: authPath
+  }),
+  puppeteer: {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-gpu'
+    ],
+    executablePath: undefined // Let puppeteer find Chrome automatically
+  },
+  webVersionCache: {
+    type: 'remote',
+    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
+  }
+});
+
+// ========================================
+// Enhanced WhatsApp Event Handlers
+// ========================================
+
+let isClientReady = false;
+let qrCodeCount = 0;
+let reconnectAttempts = 0;
+const maxReconnectAttempts = 3;
+
+client.on('loading_screen', (percent, message) => {
+  console.log(`📱 WhatsApp loading: ${percent}% - ${message}`);
+});
+
+client.on('authenticated', () => {
+  console.log('✅ WhatsApp authenticated successfully!');
+  qrCodeCount = 0;
+  reconnectAttempts = 0;
+});
+
+client.on('auth_failure', (msg) => {
+  console.error('❌ WhatsApp authentication failed:', msg);
+  
+  // Clear session data and restart
+  console.log('🔄 Clearing session data and restarting...');
+  if (fs.existsSync(authPath)) {
+    fs.rmSync(authPath, { recursive: true, force: true });
+  }
+  
+  setTimeout(() => {
+    console.log('🔄 Restarting WhatsApp client...');
+    client.initialize();
+  }, 5000);
+});
+
+client.on('qr', (qr) => {
+  qrCodeCount++;
+  console.log(`\n📱 QR Code #${qrCodeCount} - Scan with WhatsApp:`);
+  
+  if (qrCodeCount === 1) {
+    console.log('📞 First time setup - Please scan this QR code with WhatsApp');
+    console.log('📱 Instructions: WhatsApp → Settings → Linked Devices → Link a Device');
+    qrcode.generate(qr, { small: true });
+  } else if (qrCodeCount <= 3) {
+    console.log(`⚠️  QR Code regenerated (${qrCodeCount}/3) - Please scan quickly`);
+    qrcode.generate(qr, { small: true });
+  } else {
+    console.log('❌ Too many QR code attempts. Restarting...');
+    client.destroy();
+    setTimeout(() => {
+      console.log('🔄 Restarting client after multiple QR failures...');
+      client.initialize();
+    }, 10000);
+  }
+});
+
+client.on('ready', () => {
+  isClientReady = true;
+  qrCodeCount = 0;
+  reconnectAttempts = 0;
+  
+  console.log('🤖 RSIP WhatsApp Bot is ready!');
+  console.log('📞 Bot Phone Number:', client.info.wid.user);
+  console.log('📱 Bot is now listening for messages...');
+  
+  // Broadcast bot status to dashboards
+  broadcastToAllClients({
+    type: 'BOT_STATUS',
+    data: {
+      status: 'online',
+      phoneNumber: client.info.wid.user,
+      timestamp: new Date().toISOString(),
+      isReady: true
+    }
+  });
+});
+
+client.on('disconnected', (reason) => {
+  isClientReady = false;
+  console.log('📱 WhatsApp Bot disconnected:', reason);
+  
+  // Broadcast disconnection to dashboards
+  broadcastToAllClients({
+    type: 'BOT_STATUS',
+    data: {
+      status: 'offline',
+      reason: reason,
+      timestamp: new Date().toISOString(),
+      isReady: false
+    }
+  });
+  
+  // Handle different disconnection reasons
+  if (reason === 'NAVIGATION') {
+    console.log('🔄 Navigation issue - attempting reconnect...');
+    reconnectAttempts++;
+    
+    if (reconnectAttempts <= maxReconnectAttempts) {
+      setTimeout(() => {
+        console.log(`🔄 Reconnection attempt ${reconnectAttempts}/${maxReconnectAttempts}`);
+        client.initialize();
+      }, 5000 * reconnectAttempts);
+    } else {
+      console.log('❌ Max reconnection attempts reached. Manual restart required.');
+    }
+  } else if (reason === 'CONFLICT') {
+    console.log('⚠️  WhatsApp session conflict - another session is active');
+    console.log('📱 Please close WhatsApp Web on other devices and restart the bot');
+  } else {
+    console.log('🔄 Unexpected disconnection - attempting reconnect...');
+    setTimeout(() => {
+      client.initialize();
+    }, 10000);
+  }
+});
+
+// Add connection monitoring
+let connectionCheckInterval;
+
+client.on('ready', () => {
+  // Start connection monitoring
+  connectionCheckInterval = setInterval(async () => {
+    try {
+      const state = await client.getState();
+      if (state !== 'CONNECTED' && isClientReady) {
+        console.log('⚠️  Connection state changed:', state);
+        
+        if (state === 'UNPAIRED' || state === 'UNPAIRED_IDLE') {
+          console.log('📱 WhatsApp session unpaired - may need to scan QR again');
+          isClientReady = false;
+        }
+      }
+    } catch (error) {
+      console.error('Error checking connection state:', error);
+    }
+  }, 30000); // Check every 30 seconds
+});
+
+client.on('disconnected', () => {
+  if (connectionCheckInterval) {
+    clearInterval(connectionCheckInterval);
+  }
+});
+
+// Enhanced message handling with better error handling
+client.on('message_create', async (message) => {
+  if (message.fromMe) return;
+  
+  if (!isClientReady) {
+    console.log('⚠️  Received message but bot not ready yet');
+    return;
+  }
+  
+  try {
+    await handleIncomingMessage(message);
+  } catch (error) {
+    console.error('❌ Error handling message:', error);
+    
+    try {
+      await message.reply('માફ કરશો, કોઈ તકનીકી સમસ્યા છે. કૃપા કરીને થોડી વારે પ્રયાસ કરો.');
+    } catch (replyError) {
+      console.error('❌ Failed to send error message:', replyError);
+    }
+  }
+});
+
+// Enhanced message handling function (keep your existing handleIncomingMessage function)
+// Just make sure it checks for client readiness:
+
+async function handleIncomingMessage(message) {
+  if (!isClientReady) {
+    console.log('⚠️  Bot not ready, ignoring message');
+    return;
+  }
+  
+  // Your existing message handling code here...
+  // (keep all your existing handleIncomingMessage logic)
+}
+
+// ========================================
+// Graceful Shutdown Handler
+// ========================================
+
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Received SIGINT, shutting down gracefully...');
+  
+  // Clear connection monitoring
+  if (connectionCheckInterval) {
+    clearInterval(connectionCheckInterval);
+  }
+  
+  // Notify dashboards
+  broadcastToAllClients({
+    type: 'BOT_STATUS',
+    data: {
+      status: 'shutting_down',
+      timestamp: new Date().toISOString()
+    }
+  });
+  
+  try {
+    if (client) {
+      console.log('📱 Destroying WhatsApp client...');
+      await client.destroy();
+    }
+  } catch (error) {
+    console.error('Error during client shutdown:', error);
+  }
+  
+  console.log('✅ Shutdown complete');
+  process.exit(0);
+});
+
+// ========================================
+//  WhatsApp Message Handling
+// ========================================
+
+const MESSAGES = {
+  welcome: {
+    gu: '🙏 નમસ્તે! RSIP માં આપનું સ્વાગત છે.\n\nઆ બોટ રાજકોટના સફાઈ સમસ્યાઓ નોંધવા માટે છે.\n\nકૃપા કરીને તમારી ભાષા પસંદ કરો:\n1️⃣ हिंदी (Hindi)\n2️⃣ ગુજરાતી (Gujarati)\n3️⃣ English',
+    hi: '🙏 नमस्ते! RSIP में आपका स्वागत है।\n\nयह बॉट राजकोट की सफाई समस्याओं की रिपोर्ट करने के लिए है।\n\nकृपया अपनी भाषा चुनें:\n1️⃣ हिंदी (Hindi)\n2️⃣ ગુજરાતી (Gujarati)\n3️⃣ English',
+    en: '🙏 Hello! Welcome to RSIP.\n\nThis bot is for reporting sanitation issues in Rajkot.\n\nPlease choose your language:\n1️⃣ हिंदी (Hindi)\n2️⃣ ગુજરાતી (Gujarati)\n3️⃣ English'
+  },
+  
+  category_selection: {
+    gu: 'સરસ! હવે તમે કયા પ્રકારની સમસ્યા નોંધાવવા માંગો છો?\n\n1️⃣ કચરો/કચરાપેટી 🗑️\n2️⃣ ગટર/નાળું 🚰\n3️⃣ પાણીનું લીકેજ 💧\n4️⃣ માર્ગ/માળખું 🛣️\n5️⃣ અન્ય ❓\n\nનંબર મોકલો અથવા વૉઇસ મેસેજમાં સમજાવો 🎤',
+    hi: 'बहुत बढ़िया! अब आप किस प्रकार की समस्या रिपोर्ट करना चाहते हैं?\n\n1️⃣ कचरा/कचरापेटी 🗑️\n2️⃣ गटर/नाली 🚰\n3️⃣ पानी का रिसाव 💧\n4️⃣ सड़क/ढांचा 🛣️\n5️⃣ अन्य ❓\n\nनंबर भेजें या वॉइस मैसेज में बताएं 🎤',
+    en: 'Great! What type of issue would you like to report?\n\n1️⃣ Garbage/Waste 🗑️\n2️⃣ Drainage/Sewage 🚰\n3️⃣ Water Leakage 💧\n4️⃣ Road/Infrastructure 🛣️\n5️⃣ Other ❓\n\nSend number or explain via voice message 🎤'
+  }
+};
+
+const BOT_CONFIG = {
+  categories: {
+    '1': { id: 'garbage', gu: 'કચરો/કચરાપેટી', hi: 'कचरा/कचरापेटी', en: 'Garbage/Waste' },
+    '2': { id: 'drainage', gu: 'ગટર/નાળું', hi: 'गटर/नाली', en: 'Drainage/Sewage' },
+    '3': { id: 'water_leak', gu: 'પાણીનું લીકેજ', hi: 'पानी का रिसाव', en: 'Water Leakage' },
+    '4': { id: 'infrastructure', gu: 'માર્ગ/માળખું', hi: 'सड़क/ढांचा', en: 'Road/Infrastructure' },
+    '5': { id: 'other', gu: 'અન્ય', hi: 'अन्य', en: 'Other' }
+  }
+};
+
+async function handleIncomingMessage(message) {
+  const phoneNumber = message.from;
+  const messageBody = message.body.trim().toLowerCase();
+  const messageType = message.type;
+  
+  // Get or create user session
+  let session = userSessions.get(phoneNumber);
+  if (!session || session.isExpired()) {
+    session = new UserSession(phoneNumber);
+    userSessions.set(phoneNumber, session);
+  }
+  session.updateActivity();
+
+  console.log(`📱 Message from ${phoneNumber}: ${messageBody} (Type: ${messageType})`);
+
+  // Handle location
+  if (message.location) {
+    await handleLocation(message, session);
+    return;
+  }
+
+  // Handle images
+  if (messageType === 'image') {
+    await handleImage(message, session);
+    return;
+  }
+
+  // Global commands
+  if (['menu', 'મેનૂ', 'मेनू'].includes(messageBody)) {
+    session.step = 'LANGUAGE_SELECTION';
+    await sendWelcomeMessage(message);
+    return;
+  }
+
+  if (['new', 'નવી', 'नई'].includes(messageBody)) {
+    session.step = 'CATEGORY_SELECTION';
+    session.reportData = {};
+    await sendCategorySelection(message, session);
+    return;
+  }
+
+  // Step-based handling
+  switch (session.step) {
+    case 'LANGUAGE_SELECTION':
+      await handleLanguageSelection(message, session);
+      break;
+    
+    case 'CATEGORY_SELECTION':
+      await handleCategorySelection(message, session);
+      break;
+    
+    case 'LOCATION_CAPTURE':
+      await handleLocationText(message, session);
+      break;
+    
+    case 'DESCRIPTION':
+      await handleDescription(message, session);
+      break;
+    
+    default:
+      await sendWelcomeMessage(message);
+  }
+}
+
+async function handleLanguageSelection(message, session) {
+  const choice = message.body.trim();
+  
+  switch (choice) {
+    case '1':
+      session.language = 'hi';
+      break;
+    case '2':
+      session.language = 'gu';
+      break;
+    case '3':
+      session.language = 'en';
+      break;
+    default:
+      await message.reply(MESSAGES.welcome.gu);
+      return;
+  }
+  
+  session.step = 'CATEGORY_SELECTION';
+  await sendCategorySelection(message, session);
+}
+
+async function handleCategorySelection(message, session) {
+  const choice = message.body.trim();
+  
+  if (BOT_CONFIG.categories[choice]) {
+    session.reportData.category = BOT_CONFIG.categories[choice];
+    session.step = 'LOCATION_CAPTURE';
+    await sendLocationRequest(message, session);
+  } else {
+    await sendCategorySelection(message, session);
+  }
+}
+
+async function handleLocation(message, session) {
+  if (session.step !== 'LOCATION_CAPTURE') return;
+  
+  const { latitude, longitude } = message.location;
+  session.reportData.location = {
+    lat: latitude,
+    lng: longitude,
+    address: await getAddressFromCoordinates(latitude, longitude)
+  };
+  
+  // Check if we have description, if not request it
+  if (!session.reportData.description) {
+    session.step = 'DESCRIPTION';
+    await sendDescriptionRequest(message, session);
+  } else {
+    await submitComplaint(message, session);
+  }
+}
+
+async function handleLocationText(message, session) {
+  // Handle manual location entry
+  session.reportData.location = {
+    lat: null,
+    lng: null,
+    address: message.body.trim()
+  };
+  
+  session.step = 'DESCRIPTION';
+  await sendDescriptionRequest(message, session);
+}
+
+async function handleDescription(message, session) {
+  session.reportData.description = message.body.trim();
+  await submitComplaint(message, session);
+}
+
+async function handleImage(message, session) {
+  try {
+    const media = await message.downloadMedia();
+    
+    // Save image
+    const filename = `complaint_${Date.now()}.jpg`;
+    const imagePath = `./uploads/${filename}`;
+    
+    fs.writeFileSync(imagePath, media.data, 'base64');
+    
+    // Store image info
+    if (!session.reportData.photos) {
+      session.reportData.photos = [];
+    }
+    session.reportData.photos.push({
+      filename: filename,
+      path: imagePath,
+      caption: message.body || ''
+    });
+    
+    const lang = session.language || 'gu';
+    const confirmMsg = {
+      gu: '📸 ફોટો મળ્યો! હવે કૃપા કરીને તમારું સ્થાન શેર કરો.',
+      hi: '📸 फोटो मिली! अब कृपया अपना स्थान साझा करें।',
+      en: '📸 Photo received! Now please share your location.'
+    };
+    
+    await message.reply(confirmMsg[lang]);
+    
+  } catch (error) {
+    console.error('Error processing image:', error);
+    await message.reply('ફોટો અપલોડ કરવામાં સમસ્યા. કૃપા કરીને ફરીથી પ્રયાસ કરો.');
+  }
+}
+
+// ========================================
+// Helper Functions
+// ========================================
+
+async function sendWelcomeMessage(message) {
+  await message.reply(MESSAGES.welcome.gu);
+}
+
+async function sendCategorySelection(message, session) {
+  const lang = session.language || 'gu';
+  await message.reply(MESSAGES.category_selection[lang]);
+}
+
+async function sendLocationRequest(message, session) {
+  const lang = session.language || 'gu';
+  const category = session.reportData.category[lang];
+  
+  const messages = {
+    gu: `${category} સમસ્યા નોંધાઈ. હવે કૃપા કરીને:\n\n📍 તમારું સ્થાન શેર કરો (Location button દબાવો)\n📸 સમસ્યાનો ફોટો મોકલો\n🎤 અથવા વૉઇસ મેસેજમાં વિગતે સમજાવો\n\nઉદાહરણ: "ભક્તિનગર વોર્ડ 15 માં સ્કૂલ પાસે કચરાપેટી ભરાઈ ગઈ છે"`,
+    hi: `${category} समस्या दर्ज हुई। अब कृपया:\n\n📍 अपना स्थान साझा करें (Location button दबाएं)\n📸 समस्या की फोटो भेजें\n🎤 या वॉइस मैसेज में विस्तार से बताएं\n\nउदाहरण: "भक्तिनगर वार्ड 15 में स्कूल के पास कचरापेटी भर गई है"`,
+    en: `${category} issue noted. Now please:\n\n📍 Share your location (Press Location button)\n📸 Send photos of the issue\n🎤 Or explain via voice message\n\nExample: "Garbage bin overflowing near school in Bhaktinagar Ward 15"`
+  };
+  
+  await message.reply(messages[lang]);
+}
+
+async function sendDescriptionRequest(message, session) {
+  const lang = session.language || 'gu';
+  const messages = {
+    gu: 'કૃપા કરીને સમસ્યાની વિગતે માહિતી આપો:\n📝 શું સમસ્યા છે?\n⏰ ક્યારે શરૂ થઈ?\n🚨 કેટલી ગંભીર છે?',
+    hi: 'कृपया समस्या की विस्तृत जानकারी दें:\n📝 क्या समस्या है?\n⏰ कब शुरू हुई?\n🚨 कितनी गंभीर है?',
+    en: 'Please provide detailed information about the issue:\n📝 What is the problem?\n⏰ When did it start?\n🚨 How severe is it?'
+  };
+  
+  await message.reply(messages[lang]);
+}
+
+async function submitComplaint(message, session) {
+  try {
+    console.log(`📝 Submitting complaint from ${session.phoneNumber}`);
+    
+    // Generate complaint ID
+    const complaintId = generateComplaintId();
+    
+    // Determine ward from location
+    const wardId = await getWardFromLocation(session.reportData.location);
+    
+    // Prepare complaint data
+    const complaintData = {
+      id: complaintId,
+      phoneNumber: session.phoneNumber,
+      category: session.reportData.category,
+      location: session.reportData.location,
+      description: session.reportData.description || 'No description provided',
+      photos: session.reportData.photos || [],
+      language: session.language,
+      severity: determineSeverity(session.reportData),
+      status: 'open',
+      wardId: wardId,
+      wardOfficer: await getWardOfficer(wardId),
+      timestamps: {
+        created: new Date(),
+        updated: new Date(),
+        resolved: null
+      },
+      rmcResponse: '',
+      citizenFeedback: {
+        rating: null,
+        comment: ''
+      },
+      // Additional fields for dashboard
+      title: session.reportData.title || generateTitle(session.reportData),
+      titleEnglish: await translateToEnglish(session.reportData.description, session.language),
+      reportedBy: `WhatsApp User (${session.phoneNumber})`,
+      reportedAt: new Date()
+    };
+    
+    // Save to database
+    await saveComplaintToDatabase(complaintData);
+    
+    // Broadcast to WebSocket clients
+    console.log('📡 Broadcasting new issue to dashboards...');
+    
+    // Broadcast new issue
+    broadcastToAllClients({
+      type: 'NEW_ISSUE',
+      data: complaintData
+    });
+    
+    // Broadcast notification
+    broadcastToAllClients({
+      type: 'NOTIFICATION',
+      data: {
+        id: Date.now(),
+        type: determineSeverityNotificationType(complaintData.severity),
+        message: `New ${complaintData.category.en} issue reported in Ward ${complaintData.wardId}`,
+        complaintId: complaintId,
+        severity: complaintData.severity,
+        wardId: complaintData.wardId,
+        location: complaintData.location.address,
+        time: 'Just now'
+      }
+    });
+    
+    // Ward-specific broadcast
+    broadcastToWard(complaintData.wardId, {
+      type: 'WARD_NEW_ISSUE',
+      data: complaintData
+    });
+    
+    // Send confirmation to user
+    await sendConfirmation(message, session, complaintData);
+    
+    // Send SMS confirmation
+    await sendSMSConfirmation(session.phoneNumber, complaintId);
+    
+    // Reset session
+    session.step = 'COMPLETED';
+    session.reportData = {};
+    
+    console.log(`✅ Complaint ${complaintId} submitted successfully and broadcast`);
+    
+  } catch (error) {
+    console.error('❌ Error submitting complaint:', error);
+    
+    // Broadcast error notification
+    broadcastToAllClients({
+      type: 'SYSTEM_ERROR',
+      data: {
+        message: 'Failed to process new complaint',
+        error: error.message,
+        timestamp: new Date().toISOString()
+      }
+    });
+    
+    // Send error message to user
+    const lang = session.language || 'gu';
+    const errorMessages = {
+      gu: 'ફરિયાદ નોંધવામાં સમસ્યા. કૃપા કરીને ફરીથી પ્રયાસ કરો.',
+      hi: 'शिकायत दर्ज करने में समस्या। कृपया फिर से प्रयास करें।',
+      en: 'Error submitting complaint. Please try again.'
+    };
+    
+    await message.reply(errorMessages[lang]);
+  }
+}
+
+async function sendConfirmation(message, session, complaintData) {
+  const lang = session.language || 'gu';
+  
+  const messages = {
+    gu: `✅ ધન્યવાદ! તમારી ફરિયાદ સફળતાપૂર્વક નોંધાઈ ગઈ છે.\n\n📋 ફરિયાદ નંબર: #${complaintData.id}\n📍 સ્થાન: ${complaintData.location.address}\n🗂️ પ્રકાર: ${complaintData.category.gu}\n📅 તારીખ: ${new Date().toLocaleDateString()}\n\n📞 અપડેટ માટે SMS આવશે\n🕐 સામાન્ય પ્રતિસાદ સમય: 24-48 કલાક\n👨‍💼 વોર્ડ અધિકારી: ${complaintData.wardOfficer}\n\nશું તમને બીજી કોઈ સમસ્યા નોંધાવવી છે?\n"હા" લખો અથવા મુખ્ય મેનૂ માટે "મેનૂ" લખો।`,
+    
+    hi: `✅ धन्यवाद! आपकी शिकायत सफलतापूर्वक दर्ज हो गई है।\n\n📋 शिकायत नंबर: #${complaintData.id}\n📍 स्थान: ${complaintData.location.address}\n🗂️ प्रकार: ${complaintData.category.hi}\n📅 दिनांक: ${new Date().toLocaleDateString()}\n\n📞 अपडेट के लिए SMS आएगा\n🕐 सामान्य प्रतिक्रिया समय: 24-48 घंटे\n👨‍💼 वार्ड अधिकारी: ${complaintData.wardOfficer}\n\nक्या आपको कोई और समस्या रिपोर्ट करनी है?\n"हां" लिखें या मुख्य मेनू के लिए "मेनू" लिखें।`,
+    
+    en: `✅ Thank you! Your complaint has been successfully registered.\n\n📋 Complaint ID: #${complaintData.id}\n📍 Location: ${complaintData.location.address}\n🗂️ Category: ${complaintData.category.en}\n📅 Date: ${new Date().toLocaleDateString()}\n\n📞 SMS updates will be sent\n🕐 Typical response time: 24-48 hours\n👨‍💼 Ward Officer: ${complaintData.wardOfficer}\n\nDo you want to report another issue?\nType "yes" or "menu" for main menu.`
+  };
+  
+  await message.reply(messages[lang]);
+}
+
+function convertIssuesToCSV(issues) {
+  const headers = [
+    'Issue ID', 'Category', 'Ward', 'Status', 'Severity', 'Created Date',
+    'Location', 'Description', 'Assigned To', 'Phone Number', 'Language',
+    'Ward Officer', 'RMC Response'
+  ];
+  
+  const rows = issues.map(issue => [
+    issue.id,
+    issue.category,
+    issue.ward,
+    issue.status,
+    issue.severity,
+    issue.created,
+    `"${issue.location.replace(/"/g, '""')}"`, // Escape quotes in location
+    `"${issue.description.replace(/"/g, '""')}"`, // Escape quotes in description
+    issue.assignedTo,
+    issue.phoneNumber,
+    issue.language,
+    issue.wardOfficer,
+    `"${issue.rmcResponse.replace(/"/g, '""')}"` // Escape quotes in response
+  ]);
+  
+  return [headers, ...rows]
+    .map(row => row.join(','))
+    .join('\n');
+}
+
+function generateHourlyActivity(complaints) {
+  const hourlyData = Array.from({ length: 24 }, (_, hour) => ({
+    hour: hour.toString().padStart(2, '0'),
+    messages: 0
+  }));
+  
+  complaints.forEach(complaint => {
+    const created = complaint.timestamps?.created?.toDate ? 
+      complaint.timestamps.created.toDate() : new Date(complaint.timestamps?.created);
+    const hour = created.getHours();
+    hourlyData[hour].messages++;
+  });
+  
+  return hourlyData;
+}
+
+function calculateResolutionRate(issues) {
+  if (issues.length === 0) return 0;
+  const resolved = issues.filter(issue => issue.status === 'resolved').length;
+  return Math.round((resolved / issues.length) * 100);
+}
+
+function generateDetailedIssuesTrend(issues, timeRange) {
+  const days = timeRange === '24h' ? 1 : timeRange === '7d' ? 7 : timeRange === '30d' ? 30 : 90;
+  const trend = [];
+  
+  for (let i = days - 1; i >= 0; i--) {
+    const date = new Date();
+    date.setDate(date.getDate() - i);
+    const dateStr = date.toISOString().split('T')[0];
+    
+    const dayIssues = issues.filter(issue => {
+      const created = issue.timestamps?.created?.toDate ? 
+        issue.timestamps.created.toDate() : new Date(issue.timestamps?.created);
+      return created.toISOString().startsWith(dateStr);
+    });
+    
+    const dayResolved = dayIssues.filter(issue => issue.status === 'resolved');
+    
+    trend.push({
+      date: dateStr,
+      issues: dayIssues.length,
+      resolved: dayResolved.length
+    });
+  }
+  
+  return trend;
+}
+
+function generateDetailedCategoryBreakdown(issues) {
+  const categories = {};
+  
+  issues.forEach(issue => {
+    const category = issue.category?.en || 'Unknown';
+    categories[category] = (categories[category] || 0) + 1;
+  });
+  
+  const total = issues.length;
+  const colors = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#6b7280', '#8b5cf6'];
+  
+  return Object.entries(categories)
+    .map(([name, value], index) => ({
+      name,
+      value,
+      percentage: total > 0 ? Math.round((value / total) * 100) : 0,
+      color: colors[index % colors.length]
+    }))
+    .sort((a, b) => b.value - a.value);
+}
+
+async function generateDetailedWardStats(issues, wardFilter) {
+  if (wardFilter && wardFilter !== 'all') {
+    // Return single ward stats
+    const wardIssues = issues.filter(issue => issue.wardId === parseInt(wardFilter));
+    return [{
+      ward: `Ward ${wardFilter}`,
+      issues: wardIssues.length,
+      resolved: wardIssues.filter(issue => issue.status === 'resolved').length
+    }];
+  }
+  
+  // Generate stats for all wards
+  const wards = {};
+  
+  issues.forEach(issue => {
+    const ward = `Ward ${issue.wardId}`;
+    if (!wards[ward]) {
+      wards[ward] = { issues: 0, resolved: 0 };
+    }
+    wards[ward].issues++;
+    if (issue.status === 'resolved') {
+      wards[ward].resolved++;
+    }
+  });
+  
+  return Object.entries(wards)
+    .map(([ward, stats]) => ({
+      ward,
+      ...stats,
+      resolutionRate: stats.issues > 0 ? Math.round((stats.resolved / stats.issues) * 100) : 0
+    }))
+    .sort((a, b) => b.resolutionRate - a.resolutionRate);
+}
+
+function generateDetailedResponseTimeData(issues) {
+  const timeRanges = {
+    '0-2h': 0,
+    '2-6h': 0,
+    '6-12h': 0,
+    '12-24h': 0,
+    '24h+': 0
+  };
+  
+  issues.forEach(issue => {
+    if (issue.status === 'resolved' && issue.timestamps?.created && issue.timestamps?.resolved) {
+      const created = issue.timestamps.created.toDate ? 
+        issue.timestamps.created.toDate() : new Date(issue.timestamps.created);
+      const resolved = issue.timestamps.resolved.toDate ? 
+        issue.timestamps.resolved.toDate() : new Date(issue.timestamps.resolved);
+      
+      const diffHours = (resolved - created) / (1000 * 60 * 60);
+      
+      if (diffHours <= 2) timeRanges['0-2h']++;
+      else if (diffHours <= 6) timeRanges['2-6h']++;
+      else if (diffHours <= 12) timeRanges['6-12h']++;
+      else if (diffHours <= 24) timeRanges['12-24h']++;
+      else timeRanges['24h+']++;
+    }
+  });
+  
+  return Object.entries(timeRanges).map(([time, count]) => ({
+    time,
+    count
+  }));
+}
+
+function generateSeverityBreakdown(issues) {
+  const severity = { low: 0, medium: 0, high: 0, critical: 0 };
+  
+  issues.forEach(issue => {
+    if (severity.hasOwnProperty(issue.severity)) {
+      severity[issue.severity]++;
+    }
+  });
+  
+  return Object.entries(severity).map(([level, count]) => ({
+    severity: level,
+    count,
+    percentage: issues.length > 0 ? Math.round((count / issues.length) * 100) : 0
+  }));
+}
+
+function generateStatusBreakdown(issues) {
+  const status = { open: 0, in_progress: 0, resolved: 0, closed: 0 };
+  
+  issues.forEach(issue => {
+    if (status.hasOwnProperty(issue.status)) {
+      status[issue.status]++;
+    }
+  });
+  
+  return Object.entries(status).map(([state, count]) => ({
+    status: state,
+    count,
+    percentage: issues.length > 0 ? Math.round((count / issues.length) * 100) : 0
+  }));
+}
+
+// ========================================
+// Utility Functions
+// ========================================
+
+function generateComplaintId() {
+  const prefix = 'RSP';
+  const timestamp = Date.now().toString().slice(-6);
+  const random = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
+  return `${prefix}${timestamp}${random}`;
+}
+
+function determineSeverity(reportData) {
+  const description = (reportData.description || '').toLowerCase();
+  const category = reportData.category?.id || '';
+  
+  // Critical keywords
+  const criticalKeywords = ['emergency', 'urgent', 'તાત્કાલિક', 'તુરંત', 'आपातकाल', 'तुरंत'];
+  if (criticalKeywords.some(keyword => description.includes(keyword))) {
+    return 'critical';
+  }
+  
+  // High priority categories or keywords
+  const highKeywords = ['overflow', 'blocked', 'burst', 'ભરાઈ', 'બંધ', 'फूट', 'भरा'];
+  if (category === 'drainage' || highKeywords.some(keyword => description.includes(keyword))) {
+    return 'high';
+  }
+  
+  // Default to medium
+  return 'medium';
+}
+
+function determineSeverityNotificationType(severity) {
+  switch (severity) {
+    case 'critical': return 'urgent';
+    case 'high': return 'warning';
+    case 'medium': return 'info';
+    case 'low': return 'info';
+    default: return 'info';
+  }
+}
+
+function generateTitle(reportData) {
+  const category = reportData.category?.en || 'Issue';
+  const location = reportData.location?.address || 'Unknown location';
+  return `${category} reported in ${location}`;
+}
+
+async function translateToEnglish(text, fromLanguage) {
+  if (fromLanguage === 'english' || !text) return text;
+  
+  // Simple keyword mapping for demo
+  const translations = {
+    'કચરો': 'garbage',
+    'ગટર': 'drainage',
+    'પાણી': 'water',
+    'કचरा': 'garbage',
+    'नाली': 'drainage',
+    'पानी': 'water',
+    'ભરાઈ': 'overflowing',
+    'બંધ': 'blocked',
+    'भरा': 'overflowing',
+    'बंद': 'blocked'
+  };
+  
+  let translated = text;
+  for (const [original, english] of Object.entries(translations)) {
+    translated = translated.replace(new RegExp(original, 'g'), english);
+  }
+  
+  return translated;
+}
+
+async function getWardFromLocation(location) {
+  if (!location || (!location.lat && !location.address)) {
+    return Math.floor(Math.random() * 23) + 1; // Random ward for demo
+  }
+  
+  // Simple ward mapping based on coordinates or address
+  if (location.lat && location.lng) {
+    const lat = location.lat;
+    const lng = location.lng;
+    
+    // Example ward boundaries for Rajkot (replace with actual data)
+    if (lat >= 22.29 && lat <= 22.31 && lng >= 70.77 && lng <= 70.79) return 15; // Bhaktinagar
+    if (lat >= 22.27 && lat <= 22.29 && lng >= 70.78 && lng <= 70.80) return 12; // Kuvadva
+    if (lat >= 22.29 && lat <= 22.31 && lng >= 70.76 && lng <= 70.78) return 18; // Race Course
+  }
+  
+  // Address-based mapping
+  if (location.address) {
+    const address = location.address.toLowerCase();
+    if (address.includes('bhaktinagar')) return 15;
+    if (address.includes('kuvadva')) return 12;
+    if (address.includes('race course')) return 18;
+  }
+  
+  // Default ward
+  return Math.floor(Math.random() * 23) + 1;
+}
+
+async function getWardOfficer(wardId) {
+  const officers = {
+    15: 'Ramesh Patel',
+    12: 'Priya Sharma', 
+    18: 'Anjali Modi',
+    8: 'Suresh Kumar',
+    5: 'Kavita Joshi',
+    10: 'Mohit Shah',
+    20: 'Deepa Rani',
+    3: 'Ashok Mehta'
+  };
+  
+  return officers[wardId] || `Ward ${wardId} Officer`;
+}
+
+async function getAddressFromCoordinates(lat, lng) {
+  try {
+    // Using reverse geocoding API (Google Maps or similar)
+    if (process.env.GOOGLE_MAPS_API_KEY) {
+      const response = await axios.get(`https://maps.googleapis.com/maps/api/geocode/json`, {
+        params: { 
+          latlng: `${lat},${lng}`,
+          key: process.env.GOOGLE_MAPS_API_KEY 
+        }
+      });
+      
+      if (response.data.results && response.data.results.length > 0) {
+        return response.data.results[0].formatted_address;
+      }
+    }
+    
+    return `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+  } catch (error) {
+    console.error('Error getting address:', error);
+    return `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+  }
+}
+
+async function saveComplaintToDatabase(complaintData) {
+  try {
+    // Save to Firestore
+    await db.collection('complaints').doc(complaintData.id).set(complaintData);
+    
+    // Update or create user record
+    const userRef = db.collection('users').doc(complaintData.phoneNumber);
+    const userDoc = await userRef.get();
+    
+    if (userDoc.exists) {
+      await userRef.update({
+        language: complaintData.language,
+        wardId: complaintData.wardId,
+        totalReports: (userDoc.data().totalReports || 0) + 1,
+        lastActive: new Date()
+      });
+    } else {
+      await userRef.set({
+        phoneNumber: complaintData.phoneNumber,
+        language: complaintData.language,
+        name: 'Anonymous User',
+        wardId: complaintData.wardId,
+        totalReports: 1,
+        resolvedReports: 0,
+        lastActive: new Date(),
+        isBlocked: false
+      });
+    }
+    
+    console.log(`💾 Complaint ${complaintData.id} saved to database`);
+  } catch (error) {
+    console.error('Error saving complaint to database:', error);
+    throw error;
+  }
+}
+
+async function sendSMSConfirmation(phoneNumber, complaintId) {
+  try {
+    // SMS service integration (if Twilio is configured)
+    if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+      const twilio = require('twilio');
+      const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+      
+      const message = `RSIP: તમારી ફરિયાદ #${complaintId} નોંધાઈ ગઈ છે. અપડેટ માટે આ નંબર સેવ કરો.`;
+      
+      await twilioClient.messages.create({
+        body: message,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: phoneNumber
+      });
+      
+      console.log(`📱 SMS sent to ${phoneNumber}: ${message}`);
+    }
+  } catch (error) {
+    console.error('Failed to send SMS:', error);
+    // Don't throw - SMS failure shouldn't break complaint submission
+  }
+}
+
+async function notifyUserOfUpdate(complaintId, originalData, updates) {
+  try {
+    const phoneNumber = originalData.phoneNumber;
+    const language = originalData.language || 'gu';
+    
+    let updateMessage = '';
+    
+    if (updates.status === 'in_progress') {
+      const messages = {
+        gu: `📋 અપડેટ: તમારી ફરિયાદ #${complaintId} પર કામ શરૂ થયું છે.\n\n👥 ટીમ: ${updates.assignedTo || 'RMC ટીમ'}\n⏰ અપેક્ષિત સમય: 24-48 કલાક`,
+        hi: `📋 अपडेट: आपकी शिकायत #${complaintId} पर काम शुरू हो गया है।\n\n👥 टीम: ${updates.assignedTo || 'RMC टीम'}\n⏰ अपेक्षित समय: 24-48 घंटे`,
+        en: `📋 Update: Work has started on your complaint #${complaintId}.\n\n👥 Team: ${updates.assignedTo || 'RMC Team'}\n⏰ Expected time: 24-48 hours`
+      };
+      updateMessage = messages[language];
+    }
+    
+    if (updates.status === 'resolved') {
+      const messages = {
+        gu: `✅ સુખદ સમાચાર! તમારી ફરિયાદ #${complaintId} હલ થઈ ગઈ છે.\n\n📝 ${updates.rmcResponse || 'સમસ્યાનું નિરાકરણ કરાયું છે.'}\n\n⭐ કૃપા કરીને અમારી સેવા રેટ કરો (1-5):`,
+        hi: `✅ खुशखबरी! आपकी शिकायत #${complaintId} हल हो गई है।\n\n📝 ${updates.rmcResponse || 'समस्या का समाधान कर दिया गया है।'}\n\n⭐ कृपया हमारी सेवा को रेट करें (1-5):`,
+        en: `✅ Good news! Your complaint #${complaintId} has been resolved.\n\n📝 ${updates.rmcResponse || 'The issue has been resolved.'}\n\n⭐ Please rate our service (1-5):`
+      };
+      updateMessage = messages[language];
+    }
+    
+    if (updateMessage) {
+      // Send via WhatsApp bot
+      await client.sendMessage(phoneNumber, updateMessage);
+      
+      // Also send SMS backup
+      await sendSMS(phoneNumber, updateMessage.replace(/\n/g, ' '));
+    }
+    
+  } catch (error) {
+    console.error('Error notifying user of update:', error);
+    // Don't throw error - notification failure shouldn't break the update
+  }
+}
+
+async function sendSMS(phoneNumber, message) {
+  try {
+    if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+      const twilio = require('twilio');
+      const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+      
+      await twilioClient.messages.create({
+        body: message,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: phoneNumber
+      });
+      
+      console.log(`📱 SMS sent to ${phoneNumber}`);
+    }
+  } catch (error) {
+    console.error('Error sending SMS:', error);
+  }
+}
+
+async function calculateAnalytics(startDate, endDate, wardFilter = null) {
+  try {
+    let query = db.collection('complaints');
+    
+    // Apply ward filter if specified
+    if (wardFilter && wardFilter !== 'all') {
+      query = query.where('wardId', '==', parseInt(wardFilter));
+    }
+    
+    // Get all issues in date range
+    const allIssuesSnapshot = await query
+      .where('timestamps.created', '>=', startDate)
+      .where('timestamps.created', '<=', endDate)
+      .get();
+    
+    const allIssues = allIssuesSnapshot.docs.map(doc => doc.data());
+    
+    // Calculate basic stats
+    const totalIssues = allIssues.length;
+    const openIssues = allIssues.filter(issue => issue.status === 'open').length;
+    const inProgress = allIssues.filter(issue => issue.status === 'in_progress').length;
+    const resolved = allIssues.filter(issue => issue.status === 'resolved').length;
+    
+    // Calculate average response time (for resolved issues)
+    const resolvedIssues = allIssues.filter(issue => 
+      issue.status === 'resolved' && 
+      issue.timestamps?.created && 
+      issue.timestamps?.resolved
+    );
+    
+    let avgResponseTime = 0;
+    if (resolvedIssues.length > 0) {
+      const totalResponseTime = resolvedIssues.reduce((total, issue) => {
+        const created = issue.timestamps.created.toDate ? 
+          issue.timestamps.created.toDate() : issue.timestamps.created;
+        const resolved = issue.timestamps.resolved.toDate ? 
+          issue.timestamps.resolved.toDate() : issue.timestamps.resolved;
+        
+        const responseTime = (resolved - created) / (1000 * 60 * 60 * 24); // days
+        return total + responseTime;
+      }, 0);
+      
+      avgResponseTime = Math.round((totalResponseTime / resolvedIssues.length) * 10) / 10;
+    }
+    
+    // Category breakdown
+    const categoryBreakdown = {};
+    allIssues.forEach(issue => {
+      const category = issue.category?.id || 'unknown';
+      categoryBreakdown[category] = (categoryBreakdown[category] || 0) + 1;
+    });
+    
+    // Ward performance (if not filtering by specific ward)
+    let wardPerformance = [];
+    if (!wardFilter || wardFilter === 'all') {
+      const wardStats = {};
+      
+      allIssues.forEach(issue => {
+        const wardId = issue.wardId;
+        if (!wardStats[wardId]) {
+          wardStats[wardId] = {
+            ward: wardId,
+            issues: 0,
+            resolved: 0,
+            responseTime: 0,
+            responseTimeCount: 0
+          };
+        }
+        
+        wardStats[wardId].issues++;
+        
+        if (issue.status === 'resolved') {
+          wardStats[wardId].resolved++;
+          
+          // Calculate response time for this issue
+          if (issue.timestamps?.created && issue.timestamps?.resolved) {
+            const created = issue.timestamps.created.toDate ? 
+              issue.timestamps.created.toDate() : issue.timestamps.created;
+            const resolved = issue.timestamps.resolved.toDate ? 
+              issue.timestamps.resolved.toDate() : issue.timestamps.resolved;
+            
+            const responseTime = (resolved - created) / (1000 * 60 * 60 * 24);
+            wardStats[wardId].responseTime += responseTime;
+            wardStats[wardId].responseTimeCount++;
+          }
+        }
+      });
+      
+      // Convert to array and calculate average response times
+      wardPerformance = Object.values(wardStats).map(ward => ({
+        ...ward,
+        responseTime: ward.responseTimeCount > 0 ? 
+          Math.round((ward.responseTime / ward.responseTimeCount) * 10) / 10 : 0
+      })).sort((a, b) => b.resolved - a.resolved); // Sort by most resolved
+    }
+    
+    // Get WhatsApp user count
+    const usersSnapshot = await db.collection('users').get();
+    const whatsappUsers = usersSnapshot.size;
+    
+    return {
+      stats: {
+        totalIssues,
+        openIssues,
+        inProgress,
+        resolved,
+        avgResponseTime,
+        whatsappUsers,
+        resolutionRate: totalIssues > 0 ? Math.round((resolved / totalIssues) * 100) : 0
+      },
+      categoryBreakdown,
+      wardPerformance,
+      dateRange: {
+        start: startDate.toISOString(),
+        end: endDate.toISOString()
+      }
+    };
+    
+  } catch (error) {
+    console.error('Error calculating analytics:', error);
+    throw error;
+  }
+}
+
+// ========================================
+// Session Cleanup
+// ========================================
+
+// Clean up expired sessions every 10 minutes
+setInterval(() => {
+  userSessions.forEach((session, phoneNumber) => {
+    if (session.isExpired()) {
+      userSessions.delete(phoneNumber);
+      console.log(`🧹 Cleaned up expired session for ${phoneNumber}`);
+    }
+  });
+}, 10 * 60 * 1000);
+
+// ========================================
+// Server Startup
+// ========================================
+
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+  console.log(`🚀 RSIP Server running on port ${PORT}`);
+  console.log(`📡 WebSocket server ready at ws://localhost:${PORT}/ws`);
+  console.log(`🌐 HTTP API available at http://localhost:${PORT}`);
+  console.log(`📱 WhatsApp bot initializing...`);
+  console.log(`👥 Dashboard clients: ${connectedClients.size}`);
+});
+
+// Initialize WhatsApp client
+client.initialize();
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 Shutting down server...');
+  
+  // Notify all clients about shutdown
+  broadcastToAllClients({
+    type: 'SERVER_SHUTDOWN',
+    message: 'Server is shutting down for maintenance'
+  });
+  
+  // Close all WebSocket connections
+  setTimeout(() => {
+    connectedClients.forEach((client, clientId) => {
+      client.ws.close(1001, 'Server shutdown');
+    });
+    
+    server.close(() => {
+      console.log('✅ Server shut down complete');
+      process.exit(0);
+    });
+  }, 1000);
+});
+
+// Error handling
+process.on('uncaughtException', (error) => {
+  console.error('🚨 Uncaught Exception:', error);
+  
+  // Broadcast error to dashboards
+  broadcastToAllClients({
+    type: 'SYSTEM_ERROR',
+    data: {
+      message: 'Server encountered an unexpected error',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    }
+  });
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('🚨 Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Export for testing and external use
+module.exports = { 
+  app, 
+  server, 
+  client,
+  broadcastToAllClients, 
+  broadcastToWard, 
+  connectedClients,
+  userSessions
+};
+
+console.log('🚀 Initializing WhatsApp client...');
+client.initialize();
