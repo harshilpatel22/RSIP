@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="%PUBLIC_URL%/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#1e40af" />
+    <meta name="description" content="RSIP - Rajkot Sanitation Intelligence Platform Dashboard" />
+    
+    <!-- Mapbox CSS (optional - only if using Mapbox) -->
+    <link href='https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css' rel='stylesheet' />
+    
+    <title>RSIP Dashboard - Rajkot Municipal Corporation</title>
+    
+    <style>
+      /* Loading spinner for initial load */
+      #loading {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: #f5f7fa;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        z-index: 9999;
+      }
+      
+      #loading .spinner {
+        width: 40px;
+        height: 40px;
+        border: 4px solid #e5e7eb;
+        border-top: 4px solid #3b82f6;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+      }
+      
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+      
+      #loading h2 {
+        margin-top: 1rem;
+        color: #1f2937;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      }
+      
+      #loading p {
+        color: #6b7280;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <noscript>You need to enable JavaScript to run this application.</noscript>
+    
+    <!-- Loading screen -->
+    <div id="loading">
+      <div class="spinner"></div>
+      <h2>RSIP Dashboard</h2>
+      <p>Loading Rajkot Sanitation Intelligence Platform...</p>
+    </div>
+    
+    <!-- React app will mount here -->
+    <div id="root"></div>
+    
+    <!-- Mapbox JS (optional - only if using Mapbox) -->
+    <script src='https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js'></script>
+    
+    <script>
+      // Hide loading screen when React loads
+      window.addEventListener('load', function() {
+        setTimeout(function() {
+          const loading = document.getElementById('loading');
+          if (loading) {
+            loading.style.display = 'none';
+          }
+        }, 1000);
+      });
+    </script>
+  </body>
+</html>
