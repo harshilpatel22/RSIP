@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Connection Test</title>
+</head>
+<body>
+    <h1>Connection Diagnostics</h1>
+    <div id="results"></div>
+    
+    <script>
+        const results = document.getElementById('results');
+        
+        function log(message, status = 'info') {
+            const div = document.createElement('div');
+            div.style.color = status === 'error' ? 'red' : status === 'success' ? 'green' : 'blue';
+            div.textContent = `${new Date().toLocaleTimeString()}: ${message}`;
+            results.appendChild(div);
+        }
+        
+        // Test 1: WebSocket Connection
+        log('Testing WebSocket connection...');
+        try {
+            const ws = new WebSocket('ws://localhost:3000/ws');
+            
+            ws.onopen = () => {
+                log('✅ WebSocket connected successfully', 'success');
+                ws.close();
+            };
+            
+            ws.onerror = (error) => {
+                log('❌ WebSocket failed: ' + error, 'error');
+            };
+            
+            ws.onclose = () => {
+                log('📡 WebSocket disconnected');
+            };
+            
+        } catch (error) {
+            log('❌ WebSocket error: ' + error.message, 'error');
+        }
+        
+        // Test 2: Google Maps API
+        log('Testing Google Maps API...');
+        const script = document.createElement('script');
+        script.src = 'https://maps.googleapis.com/maps/api/js?key=YOUR_API_KEY_HERE';
+        
+        script.onload = () => {
+            log('✅ Google Maps API loaded successfully', 'success');
+            if (window.google && window.google.maps) {
+                log('✅ Google Maps objects available', 'success');
+            }
+        };
+        
+        script.onerror = () => {
+            log('❌ Google Maps API failed to load', 'error');
+        };
+        
+        document.head.appendChild(script);
+        
+        // Test 3: Network connectivity
+        log('Testing network connectivity...');
+        fetch('https://www.google.com/favicon.ico')
+            .then(() => log('✅ Internet connection working', 'success'))
+            .catch(() => log('❌ Internet connection failed', 'error'));
+    </script>
+</body>
+</html>
